@@ -1,5 +1,5 @@
 -- builder_worker.lua
--- Turtle worker for multi-turtle schematic builds (verbose)
+-- Turtle worker for multi-turtle schematic builds (WHOIS + verbose)
 
 if not turtle then
     error("This program must be run on a turtle.")
@@ -16,16 +16,47 @@ term.setCursorPos(1,1)
 print("=== Builder Worker ===")
 print("Enter Job PIN:")
 local pin = read()
-print("Joining job "..pin.."...")
+print("Looking for host for job "..pin.."...")
 
--- Tell host we want to join
-rednet.broadcast("JOIN|"..pin)
+----------------------------------------------------
+-- Discover host ID via WHOIS
+----------------------------------------------------
+local hostID
+
+while not hostID do
+    -- Ask "who is host for this PIN?"
+    rednet.broadcast("WHOIS|"..pin)
+    print("Broadcast WHOIS|"..pin.." ; waiting for HOST reply...")
+
+    local senderID, msg = rednet.receive(2)
+    if msg then
+        print("Received: "..msg)
+        local parts = {}
+        for w in msg:gmatch("[^|]+") do
+            table.insert(parts, w)
+        end
+
+        local cmd = parts[1]
+        local respPin = parts[2]
+
+        if cmd == "HOST" and respPin == pin then
+            -- Either take ID from payload or sender; both should match
+            hostID = tonumber(parts[3]) or senderID
+            print("Found host with ID "..hostID)
+        else
+            print("Message was not HOST for our PIN – ignoring.")
+        end
+    else
+        print("No HOST reply yet, retrying...")
+    end
+end
+
+print("Joining job "..pin.." on host "..hostID.."...")
+rednet.send(hostID, "JOIN|"..pin)
 
 ----------------------------------------------------
 -- Simple 3D movement helpers (local coordinates)
 ----------------------------------------------------
--- We assume turtle starts at build origin (0,0,0) facing +Z (rot=0).
-
 local posX, posY, posZ = 0, 0, 0
 -- rot: 0 = +Z, 1 = +X, 2 = -Z, 3 = -X
 local rot = 0
@@ -51,15 +82,10 @@ local function safeForward()
         turtle.dig()
         sleep(0.1)
     end
-    if rot == 0 then
-        posZ = posZ + 1
-    elseif rot == 1 then
-        posX = posX + 1
-    elseif rot == 2 then
-        posZ = posZ - 1
-    elseif rot == 3 then
-        posX = posX - 1
-    end
+    if     rot == 0 then posZ = posZ + 1
+    elseif rot == 1 then posX = posX + 1
+    elseif rot == 2 then posZ = posZ - 1
+    elseif rot == 3 then posX = posX - 1 end
 end
 
 local function safeUp()
@@ -78,7 +104,6 @@ local function safeDown()
     posY = posY - 1
 end
 
--- Move to local coordinates (x,y,z) in schematic space
 local function goTo(x, y, z)
     -- Vertical first (Y)
     while posY < y do safeUp() end
@@ -106,19 +131,17 @@ end
 ----------------------------------------------------
 -- Main work loop
 ----------------------------------------------------
-
-print("Requesting tasks from host...")
+print("Starting work loop...")
 
 while true do
     -- Ask host for work
-    rednet.broadcast("REQ|"..pin)
-    print("Sent REQ to host, waiting for response...")
+    rednet.send(hostID, "REQ|"..pin)
+    print("Sent REQ to host "..hostID..", waiting for response...")
 
-    -- Wait a short time for a response
-    local senderID, msg = rednet.receive(2)
+    local senderID, msg = rednet.receive(5)
 
     if msg then
-        print("Received: "..msg)
+        print("Received: "..msg.." (from "..senderID..")")
         local parts = {}
         for w in msg:gmatch("[^|]+") do
             table.insert(parts, w)
@@ -127,22 +150,19 @@ while true do
         local cmd     = parts[1]
         local respPin = parts[2]
 
-        -- Ignore messages for other jobs
-        if respPin == pin then
+        if senderID == hostID and respPin == pin then
             if cmd == "TASK" then
                 -- TASK|PIN|idx|name|x|y|z
-                local idx = tonumber(parts[3])
+                local idx  = tonumber(parts[3])
                 local name = parts[4]
-                local x = tonumber(parts[5])
-                local y = tonumber(parts[6])
-                local z = tonumber(parts[7])
+                local x    = tonumber(parts[5])
+                local y    = tonumber(parts[6])
+                local z    = tonumber(parts[7])
 
                 print(string.format("Task %d: %s at (%d,%d,%d)", idx, name, x, y, z))
 
-                -- Move to target
                 goTo(x, y, z)
 
-                -- Try to place the correct block
                 local placed = false
                 for slot = 1, 16 do
                     local item = turtle.getItemDetail(slot)
@@ -160,29 +180,24 @@ while true do
 
                 if placed then
                     print("Placed "..name.." at ("..x..","..y..","..z..")")
-                    -- Inform host we finished this block
-                    rednet.broadcast(string.format("DONE|%s|%d", pin, idx))
+                    rednet.send(hostID, ("DONE|%s|%d"):format(pin, idx))
                 else
                     print("Missing block "..name.." – waiting for restock.")
-                    rednet.broadcast(string.format("STATE|%s|restocking", pin))
-                    -- Give you time to refill the turtle manually
+                    rednet.send(hostID, ("STATE|%s|restocking"):format(pin))
                     sleep(5)
                 end
 
             elseif cmd == "DONE" then
-                -- Host says there are no more tasks
-                print("Host reports no more tasks for job "..pin..".")
+                print("Host reports no more tasks. Worker shutting down.")
                 break
             else
-                -- e.g. JOINED|PIN – harmless
-                print("Ignoring message with cmd '"..tostring(cmd).."'")
+                print("Unknown command '"..tostring(cmd).."' from host.")
             end
         else
-            print("Ignoring message for other PIN: "..tostring(respPin))
+            print("Message not from our host/PIN; ignoring.")
         end
     else
-        print("No response from host, retrying...")
-        sleep(1)
+        print("No response from host, retrying REQ...")
     end
 end
 
