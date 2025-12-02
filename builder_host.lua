@@ -1,14 +1,13 @@
 -- builder_host.lua
--- Main job host and scheduler for multi-turtle builds
+-- Main job host and scheduler for multi-turtle builds (with WHOIS handshake)
 
 local json = textutils
 local JOBS_DIR = "jobs"
 if not fs.exists(JOBS_DIR) then fs.makeDir(JOBS_DIR) end
 
--- Seed RNG for PIN generation (safe if os.epoch doesn't exist)
+-- Seed RNG
 pcall(function() math.randomseed(os.epoch("utc")) end)
 
--- Generate a 6-char PIN like "A1B2C3"
 local function genPIN()
     local chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     local pin = ""
@@ -19,12 +18,8 @@ local function genPIN()
     return pin
 end
 
--- Normalise schematic file return value
--- Works with:
---   local blocks = {...} ; return blocks
---   return { meta=..., blocks={...} }
+-- Load schematic and normalise format
 local function loadSchematic(path)
-    -- Strip ".lua" for require
     local moduleName = path:gsub("%.lua$", "")
     local ok, data = pcall(require, moduleName)
     if not ok then
@@ -35,11 +30,9 @@ local function loadSchematic(path)
     local meta
 
     if type(data) == "table" and data.blocks then
-        -- New style: {meta=..., blocks={...}}
         blocks = data.blocks
         meta   = data.meta or {}
     else
-        -- Old/simple style: return blocks
         blocks = data
         meta   = {}
     end
@@ -48,7 +41,7 @@ local function loadSchematic(path)
         error("Schematic file '" .. path .. "' did not return a table of blocks")
     end
 
-    -- Clean up block names ("minecraft:stone, None" -> "minecraft:stone")
+    -- Clean up names "minecraft:foo, None" -> "minecraft:foo"
     for _, b in ipairs(blocks) do
         if type(b.name) == "string" then
             local clean = b.name:match("([^,]+)")
@@ -67,12 +60,13 @@ print("Enter schematic file (e.g. sugar_data.lua):")
 local file = read()
 
 local sch = loadSchematic(file)
-local blocks = sch.blocks   -- guaranteed by loadSchematic
+local blocks = sch.blocks
 
 print("Loaded schematic with " .. #blocks .. " blocks.")
 
 local jobPIN = genPIN()
-print("Job PIN: " .. jobPIN)
+local hostID = os.getComputerID()
+print("Job PIN: " .. jobPIN .. " (Host ID: " .. hostID .. ")")
 
 local job = {
     id        = jobPIN,
@@ -102,7 +96,6 @@ local function saveJob()
     f.close()
 end
 
--- Return next unclaimed block index and data
 local function getNextTask()
     for i, state in ipairs(job.status) do
         if state == "todo" then
@@ -113,7 +106,6 @@ local function getNextTask()
     return nil, nil
 end
 
--- Main message loop
 while true do
     local senderID, msg = rednet.receive()
     if type(msg) == "string" then
@@ -125,27 +117,42 @@ while true do
         local cmd = parts[1]
         local pin = parts[2]
 
-        -- Ignore messages for other jobs / malformed messages
+        -- Ignore messages for other jobs
         if pin == jobPIN and cmd then
-            if cmd == "JOIN" then
+            ------------------------------------------------
+            -- WHOIS: worker asking for host for this PIN
+            ------------------------------------------------
+            if cmd == "WHOIS" then
+                -- Respond with HOST|PIN|hostID
+                local payload = ("HOST|%s|%d"):format(jobPIN, hostID)
+                rednet.send(senderID, payload)
+
+            ------------------------------------------------
+            -- JOIN: worker joining job
+            ------------------------------------------------
+            elseif cmd == "JOIN" then
                 job.turtles[senderID] = { name = "T" .. tostring(senderID), state = "idle" }
                 rednet.send(senderID, "JOINED|" .. jobPIN)
                 print("Turtle " .. senderID .. " joined job.")
                 saveJob()
 
+            ------------------------------------------------
+            -- REQ: worker requesting next task
+            ------------------------------------------------
             elseif cmd == "REQ" then
                 local idx, block = getNextTask()
                 if idx then
                     job.turtles[senderID].state = "working"
-                    -- Send TASK|PIN|idx|name|x|y|z
                     local payload = ("TASK|%s|%d|%s|%d|%d|%d")
                         :format(jobPIN, idx, block.name, block.x, block.y, block.z)
                     rednet.send(senderID, payload)
                 else
-                    -- No more tasks
                     rednet.send(senderID, "DONE|" .. jobPIN)
                 end
 
+            ------------------------------------------------
+            -- DONE: worker finished placing a block
+            ------------------------------------------------
             elseif cmd == "DONE" then
                 local idx = tonumber(parts[3])
                 if idx and job.status[idx] == "inprogress" then
@@ -154,6 +161,9 @@ while true do
                     saveJob()
                 end
 
+            ------------------------------------------------
+            -- STATE: status update from worker
+            ------------------------------------------------
             elseif cmd == "STATE" then
                 local state = parts[3]
                 if job.turtles[senderID] then
