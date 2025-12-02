@@ -1,5 +1,5 @@
 -- builder_worker.lua
--- Turtle worker for multi-turtle schematic builds (broadcast protocol)
+-- Turtle worker for multi-turtle schematic builds (broadcast protocol + fuel check)
 
 if not turtle then
     error("This program must be run on a turtle.")
@@ -33,6 +33,34 @@ print("Announcing presence to host...")
 rednet.broadcast(("JOIN|%s|%d"):format(pin, myID))
 
 ----------------------------------------------------
+-- Fuel handling
+----------------------------------------------------
+local function ensureFuel()
+    local lvl = turtle.getFuelLevel()
+    if lvl == "unlimited" then return end
+    if lvl == nil then return end  -- some configs
+
+    if lvl > 20 then return end
+
+    print("Fuel low ("..tostring(lvl).."). Trying to refuel from inventory...")
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+        if item then
+            turtle.select(slot)
+            if turtle.refuel(0) then       -- is this fuel?
+                turtle.refuel()            -- actually consume it
+                local newLvl = turtle.getFuelLevel()
+                print("Refueled. Fuel now "..tostring(newLvl))
+                return
+            end
+        end
+    end
+
+    error("Out of fuel: add coal/charcoal (or other fuel) into the turtle's inventory.")
+end
+
+----------------------------------------------------
 -- Simple 3D movement helpers (local coordinates)
 ----------------------------------------------------
 -- Turtle starts at build origin (0,0,0) facing +Z
@@ -50,33 +78,34 @@ local function face(dir)
 end
 
 local function safeForward()
+    ensureFuel()
     while not turtle.forward() do
         turtle.dig()
         sleep(0.1)
+        ensureFuel()
     end
-    if rot == 0 then
-        posZ = posZ + 1
-    elseif rot == 1 then
-        posX = posX + 1
-    elseif rot == 2 then
-        posZ = posZ - 1
-    elseif rot == 3 then
-        posX = posX - 1
-    end
+    if     rot == 0 then posZ = posZ + 1
+    elseif rot == 1 then posX = posX + 1
+    elseif rot == 2 then posZ = posZ - 1
+    elseif rot == 3 then posX = posX - 1 end
 end
 
 local function safeUp()
+    ensureFuel()
     while not turtle.up() do
         turtle.digUp()
         sleep(0.1)
+        ensureFuel()
     end
     posY = posY + 1
 end
 
 local function safeDown()
+    ensureFuel()
     while not turtle.down() do
         turtle.digDown()
         sleep(0.1)
+        ensureFuel()
     end
     posY = posY - 1
 end
@@ -170,7 +199,9 @@ while true do
                 print("Unknown command "..tostring(cmd).." for me; ignoring.")
             end
         else
-            print("Message not for me (pin="..tostring(respPin)..", id="..tostring(targetID).."); ignoring.")
+            -- Not for this worker / not our PIN
+            -- (still useful for debugging)
+            -- print("Message not for me (pin="..tostring(respPin)..", id="..tostring(targetID).."); ignoring.")
         end
     else
         print("No message, retrying REQ...")
