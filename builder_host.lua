@@ -1,5 +1,5 @@
 -- builder_host.lua
--- Main job host and scheduler for multi-turtle builds (with WHOIS handshake)
+-- Simple multi-turtle build host using broadcast + worker IDs
 
 local json = textutils
 local JOBS_DIR = "jobs"
@@ -16,6 +16,14 @@ local function genPIN()
         pin = pin .. chars:sub(idx, idx)
     end
     return pin
+end
+
+local function split(msg)
+    local t = {}
+    for w in msg:gmatch("[^|]+") do
+        t[#t+1] = w
+    end
+    return t
 end
 
 -- Load schematic and normalise format
@@ -41,7 +49,7 @@ local function loadSchematic(path)
         error("Schematic file '" .. path .. "' did not return a table of blocks")
     end
 
-    -- Clean up names "minecraft:foo, None" -> "minecraft:foo"
+    -- Clean up names "minecraft:stone, None" -> "minecraft:stone"
     for _, b in ipairs(blocks) do
         if type(b.name) == "string" then
             local clean = b.name:match("([^,]+)")
@@ -65,14 +73,13 @@ local blocks = sch.blocks
 print("Loaded schematic with " .. #blocks .. " blocks.")
 
 local jobPIN = genPIN()
-local hostID = os.getComputerID()
-print("Job PIN: " .. jobPIN .. " (Host ID: " .. hostID .. ")")
+print("Job PIN: " .. jobPIN)
 
 local job = {
     id        = jobPIN,
     schematic = sch,
     status    = {},
-    turtles   = {},
+    turtles   = {},   -- [id] = {state="...", placed=0}
     stats     = { total = #blocks, placed = 0, start = os.clock() }
 }
 
@@ -109,67 +116,54 @@ end
 while true do
     local senderID, msg = rednet.receive()
     if type(msg) == "string" then
-        local parts = {}
-        for w in msg:gmatch("[^|]+") do
-            table.insert(parts, w)
-        end
+        local p = split(msg)
+        local cmd   = p[1]
+        local pin   = p[2]
+        local wID   = tonumber(p[3])
 
-        local cmd = parts[1]
-        local pin = parts[2]
-
-        -- Ignore messages for other jobs
-        if pin == jobPIN and cmd then
-            ------------------------------------------------
-            -- WHOIS: worker asking for host for this PIN
-            ------------------------------------------------
-            if cmd == "WHOIS" then
-                -- Respond with HOST|PIN|hostID
-                local payload = ("HOST|%s|%d"):format(jobPIN, hostID)
-                rednet.send(senderID, payload)
-
-            ------------------------------------------------
-            -- JOIN: worker joining job
-            ------------------------------------------------
-            elseif cmd == "JOIN" then
-                job.turtles[senderID] = { name = "T" .. tostring(senderID), state = "idle" }
-                rednet.send(senderID, "JOINED|" .. jobPIN)
-                print("Turtle " .. senderID .. " joined job.")
+        if pin == jobPIN and cmd and wID then
+            if cmd == "JOIN" then
+                job.turtles[wID] = job.turtles[wID] or { state = "idle", placed = 0 }
+                print("Worker " .. wID .. " joined job.")
                 saveJob()
 
-            ------------------------------------------------
-            -- REQ: worker requesting next task
-            ------------------------------------------------
             elseif cmd == "REQ" then
                 local idx, block = getNextTask()
                 if idx then
-                    job.turtles[senderID].state = "working"
-                    local payload = ("TASK|%s|%d|%s|%d|%d|%d")
-                        :format(jobPIN, idx, block.name, block.x, block.y, block.z)
-                    rednet.send(senderID, payload)
-                else
-                    rednet.send(senderID, "DONE|" .. jobPIN)
-                end
+                    job.turtles[wID] = job.turtles[wID] or { state = "idle", placed = 0 }
+                    job.turtles[wID].state = "working"
 
-            ------------------------------------------------
-            -- DONE: worker finished placing a block
-            ------------------------------------------------
-            elseif cmd == "DONE" then
-                local idx = tonumber(parts[3])
+                    local payload = ("TASK|%s|%d|%d|%s|%d|%d|%d")
+                        :format(jobPIN, wID, idx, block.name, block.x, block.y, block.z)
+                    rednet.broadcast(payload)
+                    print(("Sent TASK %d to worker %d"):format(idx, wID))
+                else
+                    local payload = ("IDLE|%s|%d"):format(jobPIN, wID)
+                    rednet.broadcast(payload)
+                    print("No more tasks, told worker " .. wID .. " to idle.")
+                end
+                saveJob()
+
+            elseif cmd == "COMPLETE" then
+                local idx = tonumber(p[4])
                 if idx and job.status[idx] == "inprogress" then
                     job.status[idx] = "done"
                     job.stats.placed = job.stats.placed + 1
+
+                    job.turtles[wID] = job.turtles[wID] or { state = "idle", placed = 0 }
+                    job.turtles[wID].state = "idle"
+                    job.turtles[wID].placed = job.turtles[wID].placed + 1
+
+                    print(("Worker %d completed block %d (%d/%d total)")
+                        :format(wID, idx, job.stats.placed, job.stats.total))
                     saveJob()
                 end
 
-            ------------------------------------------------
-            -- STATE: status update from worker
-            ------------------------------------------------
             elseif cmd == "STATE" then
-                local state = parts[3]
-                if job.turtles[senderID] then
-                    job.turtles[senderID].state = state or "unknown"
-                    saveJob()
-                end
+                local state = p[4] or "unknown"
+                job.turtles[wID] = job.turtles[wID] or { placed = 0 }
+                job.turtles[wID].state = state
+                saveJob()
             end
         end
     end
