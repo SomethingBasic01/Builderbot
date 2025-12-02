@@ -1,9 +1,20 @@
 -- builder_worker.lua
--- Turtle worker for multi-turtle schematic builds (broadcast protocol + fuel check)
+-- Turtle worker for multi-turtle schematic builds
+-- Supports:
+--   - broadcast host protocol
+--   - fuel from inventory + simple fuel chest
+--   - materials chest in front of origin
+--   - verbose inventory debugging
 
 if not turtle then
     error("This program must be run on a turtle.")
 end
+
+-- === CONFIG: chest positions relative to START ===
+-- Turtle starts at (0,0,0), facing +Z (front).
+local MATERIAL_SIDE = "front" -- material chest is 1 block in front of the turtle at origin
+local FUEL_SIDE     = "right" -- fuel chest is 1 block to the right of the turtle at origin
+-- ================================================
 
 local modem = peripheral.find("modem")
 if not modem then
@@ -33,37 +44,9 @@ print("Announcing presence to host...")
 rednet.broadcast(("JOIN|%s|%d"):format(pin, myID))
 
 ----------------------------------------------------
--- Fuel handling
+-- Position / orientation tracking
 ----------------------------------------------------
-local function ensureFuel()
-    local lvl = turtle.getFuelLevel()
-    if lvl == "unlimited" then return end
-    if lvl == nil then return end  -- some configs
-
-    if lvl > 20 then return end
-
-    print("Fuel low ("..tostring(lvl).."). Trying to refuel from inventory...")
-
-    for slot = 1, 16 do
-        local item = turtle.getItemDetail(slot)
-        if item then
-            turtle.select(slot)
-            if turtle.refuel(0) then       -- is this fuel?
-                turtle.refuel()            -- actually consume it
-                local newLvl = turtle.getFuelLevel()
-                print("Refueled. Fuel now "..tostring(newLvl))
-                return
-            end
-        end
-    end
-
-    error("Out of fuel: add coal/charcoal (or other fuel) into the turtle's inventory.")
-end
-
-----------------------------------------------------
--- Simple 3D movement helpers (local coordinates)
-----------------------------------------------------
--- Turtle starts at build origin (0,0,0) facing +Z
+-- Turtle starts at origin (0,0,0) facing +Z
 
 local posX, posY, posZ = 0, 0, 0
 local rot = 0 -- 0=+Z, 1=+X, 2=-Z, 3=-X
@@ -73,10 +56,122 @@ local function turnRight()
     rot = (rot + 1) % 4
 end
 
-local function face(dir)
-    while rot ~= dir do turnRight() end
+local function turnLeft()
+    turtle.turnLeft()
+    rot = (rot + 3) % 4
 end
 
+local function face(dir)
+    while rot ~= dir do
+        turnRight()
+    end
+end
+
+local function rotationForSide(side)
+    if side == "front" then return 0
+    elseif side == "right" then return 1
+    elseif side == "back" then return 2
+    elseif side == "left" then return 3
+    else
+        return 0
+    end
+end
+
+----------------------------------------------------
+-- Fuel handling
+----------------------------------------------------
+local function tryRefuelFromInventory()
+    local lvl = turtle.getFuelLevel()
+    if lvl == "unlimited" or lvl == nil then return true end
+
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+        if item then
+            turtle.select(slot)
+            if turtle.refuel(0) then   -- is this fuel?
+                turtle.refuel()
+                print("Refueled from slot "..slot..". Fuel now: "..tostring(turtle.getFuelLevel()))
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function refuelFromChest()
+    print("Trying to refuel from fuel chest...")
+    local sx, sy, sz, srot = posX, posY, posZ, rot
+
+    -- go back to origin
+    local function goToRaw(x,y,z)
+        -- NOTE: this version does NOT call ensureFuel to avoid recursion
+        while posY < y do
+            while not turtle.up() do turtle.digUp(); sleep(0.1) end
+            posY = posY + 1
+        end
+        while posY > y do
+            while not turtle.down() do turtle.digDown(); sleep(0.1) end
+            posY = posY - 1
+        end
+
+        if posX < x then
+            face(1)
+            while posX < x do
+                while not turtle.forward() do turtle.dig(); sleep(0.1) end
+                posX = posX + 1
+            end
+        elseif posX > x then
+            face(3)
+            while posX > x do
+                while not turtle.forward() do turtle.dig(); sleep(0.1) end
+                posX = posX - 1
+            end
+        end
+
+        if posZ < z then
+            face(0)
+            while posZ < z do
+                while not turtle.forward() do turtle.dig(); sleep(0.1) end
+                posZ = posZ + 1
+            end
+        elseif posZ > z then
+            face(2)
+            while posZ > z do
+                while not turtle.forward() do turtle.dig(); sleep(0.1) end
+                posZ = posZ - 1
+            end
+        end
+    end
+
+    goToRaw(0,0,0)
+    face(rotationForSide(FUEL_SIDE))
+
+    -- fuel chest 1 block in front
+    turtle.suck(64)
+
+    if not tryRefuelFromInventory() then
+        error("Could not refuel from fuel chest: add coal/charcoal etc.")
+    end
+
+    -- go back
+    goToRaw(sx,sy,sz)
+    while rot ~= srot do turnRight() end
+end
+
+local function ensureFuel()
+    local lvl = turtle.getFuelLevel()
+    if lvl == "unlimited" or lvl == nil then return end
+    if lvl > 20 then return end
+
+    if tryRefuelFromInventory() then return end
+
+    -- If still low, try the chest
+    refuelFromChest()
+end
+
+----------------------------------------------------
+-- Movement helpers (use ensureFuel)
+----------------------------------------------------
 local function safeForward()
     ensureFuel()
     while not turtle.forward() do
@@ -135,6 +230,43 @@ local function goTo(x, y, z)
 end
 
 ----------------------------------------------------
+-- Material chest restock
+----------------------------------------------------
+local function restockFromMaterialChest()
+    print("Restocking materials from chest...")
+    local sx, sy, sz, srot = posX, posY, posZ, rot
+
+    -- go back to origin
+    goTo(0,0,0)
+    face(rotationForSide(MATERIAL_SIDE))
+
+    -- pull a stack from the chest in front
+    turtle.suck(64)
+    print("Pulled items from material chest.")
+
+    -- go back
+    goTo(sx,sy,sz)
+    while rot ~= srot do turnRight() end
+end
+
+----------------------------------------------------
+-- Helper: find block slot & debug inventory
+----------------------------------------------------
+local function findBlockSlot(targetName)
+    print("Looking for block "..targetName.." in inventory:")
+    for slot = 1, 16 do
+        local item = turtle.getItemDetail(slot)
+        if item then
+            print(("  slot %2d: %s x%d"):format(slot, item.name, item.count))
+            if item.name == targetName then
+                return slot
+            end
+        end
+    end
+    return nil
+end
+
+----------------------------------------------------
 -- Main work loop
 ----------------------------------------------------
 print("Starting work loop...")
@@ -167,27 +299,31 @@ while true do
 
                 goTo(x, y, z)
 
-                -- Find the block and place it
-                local placed = false
-                for slot = 1, 16 do
-                    local item = turtle.getItemDetail(slot)
-                    if item and item.name == name then
-                        turtle.select(slot)
-                        placed = turtle.placeDown()
-                        if not placed then
-                            turtle.digDown()
-                            sleep(0.1)
-                            placed = turtle.placeDown()
-                        end
-                        if placed then break end
-                    end
+                -- Try to find block
+                local slot = findBlockSlot(name)
+                if not slot then
+                    print("Don't have "..name.." in inventory, attempting restock.")
+                    restockFromMaterialChest()
+                    slot = findBlockSlot(name)
                 end
 
-                if placed then
-                    print("Placed "..name.." at ("..x..","..y..","..z..")")
-                    rednet.broadcast(("COMPLETE|%s|%d|%d"):format(pin, myID, idx))
+                if slot then
+                    turtle.select(slot)
+                    local placed = turtle.placeDown()
+                    if not placed then
+                        turtle.digDown()
+                        sleep(0.1)
+                        placed = turtle.placeDown()
+                    end
+
+                    if placed then
+                        print("Placed "..name.." at ("..x..","..y..","..z..")")
+                        rednet.broadcast(("COMPLETE|%s|%d|%d"):format(pin, myID, idx))
+                    else
+                        print("Could not place "..name.." even after selecting slot "..slot..".")
+                    end
                 else
-                    print("Missing "..name.." – waiting for restock.")
+                    print("Still missing "..name.." after restock. Waiting...")
                     rednet.broadcast(("STATE|%s|%d|restocking"):format(pin, myID))
                     sleep(5)
                 end
@@ -198,10 +334,6 @@ while true do
             else
                 print("Unknown command "..tostring(cmd).." for me; ignoring.")
             end
-        else
-            -- Not for this worker / not our PIN
-            -- (still useful for debugging)
-            -- print("Message not for me (pin="..tostring(respPin)..", id="..tostring(targetID).."); ignoring.")
         end
     else
         print("No message, retrying REQ...")
