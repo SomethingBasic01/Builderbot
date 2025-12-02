@@ -1,5 +1,5 @@
 -- builder_worker.lua
--- Turtle worker for multi-turtle schematic builds
+-- Turtle worker for multi-turtle schematic builds (verbose)
 
 if not turtle then
     error("This program must be run on a turtle.")
@@ -22,9 +22,9 @@ print("Joining job "..pin.."...")
 rednet.broadcast("JOIN|"..pin)
 
 ----------------------------------------------------
--- Simple 3D movement helpers (relative coordinates)
+-- Simple 3D movement helpers (local coordinates)
 ----------------------------------------------------
--- We assume turtle starts at build origin (0,0,0) facing "north" (rot=0).
+-- We assume turtle starts at build origin (0,0,0) facing +Z (rot=0).
 
 local posX, posY, posZ = 0, 0, 0
 -- rot: 0 = +Z, 1 = +X, 2 = -Z, 3 = -X
@@ -41,7 +41,6 @@ local function turnLeft()
 end
 
 local function face(dir)
-    -- rotate shortest way
     while rot ~= dir do
         turnRight()
     end
@@ -81,7 +80,7 @@ end
 
 -- Move to local coordinates (x,y,z) in schematic space
 local function goTo(x, y, z)
-    -- Vertical first
+    -- Vertical first (Y)
     while posY < y do safeUp() end
     while posY > y do safeDown() end
 
@@ -108,20 +107,24 @@ end
 -- Main work loop
 ----------------------------------------------------
 
+print("Requesting tasks from host...")
+
 while true do
     -- Ask host for work
     rednet.broadcast("REQ|"..pin)
+    print("Sent REQ to host, waiting for response...")
 
     -- Wait a short time for a response
     local senderID, msg = rednet.receive(2)
 
     if msg then
+        print("Received: "..msg)
         local parts = {}
         for w in msg:gmatch("[^|]+") do
             table.insert(parts, w)
         end
 
-        local cmd = parts[1]
+        local cmd     = parts[1]
         local respPin = parts[2]
 
         -- Ignore messages for other jobs
@@ -156,6 +159,7 @@ while true do
                 end
 
                 if placed then
+                    print("Placed "..name.." at ("..x..","..y..","..z..")")
                     -- Inform host we finished this block
                     rednet.broadcast(string.format("DONE|%s|%d", pin, idx))
                 else
@@ -167,12 +171,17 @@ while true do
 
             elseif cmd == "DONE" then
                 -- Host says there are no more tasks
-                print("No more tasks for job "..pin..". Shutting down worker.")
+                print("Host reports no more tasks for job "..pin..".")
                 break
+            else
+                -- e.g. JOINED|PIN – harmless
+                print("Ignoring message with cmd '"..tostring(cmd).."'")
             end
+        else
+            print("Ignoring message for other PIN: "..tostring(respPin))
         end
     else
-        -- No message, idle briefly
+        print("No response from host, retrying...")
         sleep(1)
     end
 end
