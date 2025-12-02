@@ -1,11 +1,11 @@
--- build_host.lua  (or builder.lua if that's what you're using)
--- Main job host and scheduler
+-- builder_host.lua
+-- Main job host and scheduler for multi-turtle builds
 
 local json = textutils
 local JOBS_DIR = "jobs"
 if not fs.exists(JOBS_DIR) then fs.makeDir(JOBS_DIR) end
 
--- Seed RNG for PIN generation
+-- Seed RNG for PIN generation (safe if os.epoch doesn't exist)
 pcall(function() math.randomseed(os.epoch("utc")) end)
 
 -- Generate a 6-char PIN like "A1B2C3"
@@ -48,7 +48,7 @@ local function loadSchematic(path)
         error("Schematic file '" .. path .. "' did not return a table of blocks")
     end
 
-    -- Optionally clean up block names ("minecraft:stone, None" -> "minecraft:stone")
+    -- Clean up block names ("minecraft:stone, None" -> "minecraft:stone")
     for _, b in ipairs(blocks) do
         if type(b.name) == "string" then
             local clean = b.name:match("([^,]+)")
@@ -60,6 +60,8 @@ local function loadSchematic(path)
 end
 
 -- === MAIN ===
+term.clear()
+term.setCursorPos(1,1)
 print("=== Build Host ===")
 print("Enter schematic file (e.g. sugar_data.lua):")
 local file = read()
@@ -111,55 +113,54 @@ local function getNextTask()
     return nil, nil
 end
 
+-- Main message loop
 while true do
     local senderID, msg = rednet.receive()
-    local parts = {}
-    for w in msg:gmatch("[^|]+") do
-        table.insert(parts, w)
-    end
-
-    local cmd = parts[1]
-    local pin = parts[2]
-
-    if pin ~= jobPIN then
-        -- Not our job, ignore
-        goto continue
-    end
-
-    if cmd == "JOIN" then
-        job.turtles[senderID] = { name = "T" .. tostring(senderID), state = "idle" }
-        rednet.send(senderID, "JOINED|" .. jobPIN)
-        print("Turtle " .. senderID .. " joined job.")
-        saveJob()
-
-    elseif cmd == "REQ" then
-        local idx, block = getNextTask()
-        if idx then
-            job.turtles[senderID].state = "working"
-            -- Send TASK|PIN|idx|name|x|y|z
-            local payload = ("TASK|%s|%d|%s|%d|%d|%d")
-                :format(jobPIN, idx, block.name, block.x, block.y, block.z)
-            rednet.send(senderID, payload)
-        else
-            -- No more tasks
-            rednet.send(senderID, "DONE|" .. jobPIN)
+    if type(msg) == "string" then
+        local parts = {}
+        for w in msg:gmatch("[^|]+") do
+            table.insert(parts, w)
         end
 
-    elseif cmd == "DONE" then
-        local idx = tonumber(parts[3])
-        if job.status[idx] == "inprogress" then
-            job.status[idx] = "done"
-            job.stats.placed = job.stats.placed + 1
-            saveJob()
-        end
+        local cmd = parts[1]
+        local pin = parts[2]
 
-    elseif cmd == "STATE" then
-        local state = parts[3]
-        if job.turtles[senderID] then
-            job.turtles[senderID].state = state
-            saveJob()
+        -- Ignore messages for other jobs / malformed messages
+        if pin == jobPIN and cmd then
+            if cmd == "JOIN" then
+                job.turtles[senderID] = { name = "T" .. tostring(senderID), state = "idle" }
+                rednet.send(senderID, "JOINED|" .. jobPIN)
+                print("Turtle " .. senderID .. " joined job.")
+                saveJob()
+
+            elseif cmd == "REQ" then
+                local idx, block = getNextTask()
+                if idx then
+                    job.turtles[senderID].state = "working"
+                    -- Send TASK|PIN|idx|name|x|y|z
+                    local payload = ("TASK|%s|%d|%s|%d|%d|%d")
+                        :format(jobPIN, idx, block.name, block.x, block.y, block.z)
+                    rednet.send(senderID, payload)
+                else
+                    -- No more tasks
+                    rednet.send(senderID, "DONE|" .. jobPIN)
+                end
+
+            elseif cmd == "DONE" then
+                local idx = tonumber(parts[3])
+                if idx and job.status[idx] == "inprogress" then
+                    job.status[idx] = "done"
+                    job.stats.placed = job.stats.placed + 1
+                    saveJob()
+                end
+
+            elseif cmd == "STATE" then
+                local state = parts[3]
+                if job.turtles[senderID] then
+                    job.turtles[senderID].state = state or "unknown"
+                    saveJob()
+                end
+            end
         end
     end
-
-    ::continue::
 end
